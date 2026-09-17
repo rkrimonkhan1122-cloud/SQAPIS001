@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+env/
+.env
+*.log
+square_approved.txt
+square_declined.txt
+square_unknown.txt
+px.txt
+.DS_Store
