@@ -44,7 +44,7 @@ import checker
 MAX_CONCURRENT_CHECKS = int(os.environ.get("MAX_CONCURRENT_CHECKS", "200"))
 THREAD_POOL_SIZE       = int(os.environ.get("THREAD_POOL_SIZE", "200"))
 
-VERSION = "4.2.0"
+VERSION = "4.2.1"
 
 
 # ============================================================================
