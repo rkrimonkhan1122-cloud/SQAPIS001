@@ -1,5 +1,5 @@
 """
-main.py — Square Deluxe Charger API v2.0 (FastAPI)
+main.py — Square Deluxe Charger API v4.2 (AUTO-FAKER)
 
 Endpoints
 ─────────
@@ -18,6 +18,10 @@ Usage (simplest call):
 
 The `proxy` and `amount` params are optional — proxy defaults to direct
 (test mode), amount defaults to $1.00.
+
+v4.2: EVERY request auto-fetches a fresh REAL US identity from
+fakenamegenerator.com (name, street, city, state, ZIP, phone) and uses it
+across the whole checkout flow — fixes ADDRESS_VERIFICATION_FAILURE.
 """
 
 import os
@@ -40,7 +44,7 @@ import checker
 MAX_CONCURRENT_CHECKS = int(os.environ.get("MAX_CONCURRENT_CHECKS", "200"))
 THREAD_POOL_SIZE       = int(os.environ.get("THREAD_POOL_SIZE", "200"))
 
-VERSION = "4.1.0"
+VERSION = "4.2.0"
 
 
 # ============================================================================
@@ -222,11 +226,18 @@ async def health():
             "3DS challenge auto-resolution (SQUARE_THREEDS challenges marked COMPLETED)",
             "PoW auto-solve (SHA256 prefix matching, up to 500K iterations)",
             "Custom amount support ($1.00 default, any amount up to unlimited)",
+            "AUTO-FAKER v4.2: EVERY request gets a fresh REAL US identity from "
+            "fakenamegenerator.com (name + street + city + state + zip + phone) — "
+            "full billing address in verification \u2192 NO MORE ADDRESS_VERIFICATION_FAILURE",
+            "AVS auto-retry: on AVS_REJECTED the charge re-runs with a brand-new "
+            "real identity (up to 5 attempts)",
+            "Response includes the identity used (name/address/email/phone/source)",
         ],
         "endpoints": {
             "single":      "GET  /check?site=...&card=...&proxy=...&amount=1.00",
             "single_post": "POST /check  (JSON body)",
             "multi":       "POST /check_multi  (JSON body)",
+            "faker":       "GET  /faker  (live auto-faker identity test)",
             "test_cards":  "GET  /test_cards",
             "stats":       "GET  /stats",
             "docs":        "/docs",
@@ -331,6 +342,29 @@ async def check_multi(req: CheckMultiRequest):
 
 
 # ============================================================================
+#  GET /faker — live test of the auto-faker identity chain (v4.2)
+# ============================================================================
+@app.get("/faker")
+async def faker_test():
+    """Fetch one fresh REAL US identity through the same chain every /check
+    request uses (fakenamegenerator.com \u2192 $FAKER_URL \u2192 pool \u2192 fallback)."""
+    if not checker.HAS_FAKER:
+        raise HTTPException(status_code=503, detail="faker_client not available")
+    start = time.time()
+    try:
+        ident = await asyncio.get_running_loop().run_in_executor(
+            _executor, checker.faker_client.get_identity_safe)
+        return {
+            "ok": True,
+            "elapsed": round(time.time() - start, 2),
+            "identity": ident,
+            "chain_status": checker.faker_client.status(),
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ============================================================================
 #  GET /stats
 # ============================================================================
 @app.get("/stats")
@@ -342,6 +376,8 @@ async def stats():
         "total_dispatched":      _total_checks,
         "version":               VERSION,
         "curl_cffi_enabled":    checker.HAS_CFFI,
+        "faker_enabled":         checker.HAS_FAKER,
+        "faker_source":          "fakenamegenerator.com (ALL SELF) per request",
         "impersonate_target":   "chrome131",
         "flow":                  "12-step Square checkout (order → update → visited → "
                                  "customer → hydrate → product-info → 3DS-method → "
