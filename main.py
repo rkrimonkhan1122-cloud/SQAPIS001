@@ -41,10 +41,10 @@ import checker
 # ============================================================================
 #  CONFIG
 # ============================================================================
-MAX_CONCURRENT_CHECKS = int(os.environ.get("MAX_CONCURRENT_CHECKS", "200"))
-THREAD_POOL_SIZE       = int(os.environ.get("THREAD_POOL_SIZE", "200"))
+MAX_CONCURRENT_CHECKS = int(os.environ.get("MAX_CONCURRENT_CHECKS", "2000"))
+THREAD_POOL_SIZE       = int(os.environ.get("THREAD_POOL_SIZE", "2000"))
 
-VERSION = "4.2.2"
+VERSION = "35.0.0"
 
 
 # ============================================================================
@@ -143,7 +143,7 @@ class CheckMultiRequest(BaseModel):
     cards:   List[str]        = Field(...,  description="List of cards in pipe format (max 200)")
     proxy:   Optional[str]    = Field("",   description="ANY proxy format — empty = direct/test mode")
     amount:  Optional[float]  = Field(1.00, description="Amount in USD per card")
-    workers: Optional[int]    = Field(15,   description="Parallel workers (max 50)")
+    workers: Optional[int]    = Field(50,   description="Parallel workers (max 200)")
 
 
 # ============================================================================
