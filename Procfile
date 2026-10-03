@@ -1,1 +1,1 @@
-web: uvicorn main:app --host 0.0.0.0 --port $PORT --workers 2 --timeout-keep-alive 30 --no-access-log
+web: uvicorn main:app --host 0.0.0.0 --port $PORT --workers 4 --timeout-keep-alive 60 --no-access-log
