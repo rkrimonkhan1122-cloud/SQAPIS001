@@ -41,10 +41,10 @@ import checker
 # ============================================================================
 #  CONFIG
 # ============================================================================
-MAX_CONCURRENT_CHECKS = int(os.environ.get("MAX_CONCURRENT_CHECKS", "2000"))
-THREAD_POOL_SIZE       = int(os.environ.get("THREAD_POOL_SIZE", "2000"))
+MAX_CONCURRENT_CHECKS = int(os.environ.get("MAX_CONCURRENT_CHECKS", "200"))
+THREAD_POOL_SIZE       = int(os.environ.get("THREAD_POOL_SIZE", "200"))
 
-VERSION = "50.0.0"
+VERSION = "4.2.2"
 
 
 # ============================================================================
@@ -143,14 +143,13 @@ class CheckMultiRequest(BaseModel):
     cards:   List[str]        = Field(...,  description="List of cards in pipe format (max 200)")
     proxy:   Optional[str]    = Field("",   description="ANY proxy format — empty = direct/test mode")
     amount:  Optional[float]  = Field(1.00, description="Amount in USD per card")
-    workers: Optional[int]    = Field(50,   description="Parallel workers (max 200)")
+    workers: Optional[int]    = Field(15,   description="Parallel workers (max 50)")
 
 
 # ============================================================================
 #  Helpers
 # ============================================================================
 async def _run_check_async(card, site, proxy, amount_cents, email):
-    """v50 — NEVER fails.  Always returns a result dict, even on error."""
     async with _semaphore:
         _incr_active()
         _incr_total()
@@ -161,26 +160,11 @@ async def _run_check_async(card, site, proxy, amount_cents, email):
                 checker.check_one_sync,
                 card, site, proxy, amount_cents, email,
             )
-        except Exception as e:
-            # v50 — graceful error recovery: never let a request fail silently
-            return {
-                "status": "ERROR",
-                "card": card or "",
-                "card_brand": "?",
-                "price": f"${amount_cents/100:.2f}",
-                "elapsed": 0.0,
-                "response": f"Request failed: {str(e)[:200]}",
-                "site": site or "",
-                "email": email or "",
-                "amount_cents": amount_cents,
-                "raw": {},
-            }
         finally:
             _decr_active()
 
 
 async def _run_check_multi_async(cards, site, proxy, amount_cents, workers):
-    """v50 — NEVER fails.  Always returns a list of results."""
     async with _semaphore:
         _incr_active()
         _incr_total()
@@ -191,10 +175,6 @@ async def _run_check_multi_async(cards, site, proxy, amount_cents, workers):
                 checker.check_multi_sync,
                 cards, site, proxy, amount_cents, workers,
             )
-        except Exception as e:
-            # v50 — graceful error recovery
-            return [{"status": "ERROR", "card": c, "response": f"Batch failed: {str(e)[:200]}",
-                     "site": site, "raw": {}} for c in cards]
         finally:
             _decr_active()
 
@@ -346,8 +326,8 @@ async def check_multi(req: CheckMultiRequest):
     if not req.site or not req.site.strip():
         raise HTTPException(status_code=400, detail="site is required")
 
-    cards = req.cards[:2000]  # v40 — up to 2000 cards
-    workers = min(req.workers or 200, 2000, len(cards))  # v40 — up to 2000 workers
+    cards = req.cards[:200]
+    workers = min(req.workers or 15, 50, len(cards))
     amount_cents = _parse_amount(req.amount)
 
     try:
